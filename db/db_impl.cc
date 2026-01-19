@@ -1268,11 +1268,15 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
   // May temporarily unlock and wait.
   Status status = MakeRoomForWrite(updates == nullptr);
   uint64_t last_sequence = versions_->LastSequence();
+
+  // 这个last_writer用于标记合并的边界
   Writer* last_writer = &w;
   if (status.ok() && updates != nullptr) {  // nullptr batch is for compactions
 
     // 合并多个写请求到一个批次
     // 注意此时持有锁，因此写批次从提交到合并的过程中，其他写请求会被阻塞
+
+    // BuildBatchGroup 的入参是个二级指针，会逐渐将last_writer移动到合并的最后一个写请求
     WriteBatch* write_batch = BuildBatchGroup(&last_writer);
 
     WriteBatchInternal::SetSequence(write_batch, last_sequence + 1);
@@ -1321,11 +1325,12 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
       ready->done = true;
       ready->cv.Signal(); // 通知指定的写批次写入完成，唤醒等待的线程
     }
-    // 
+    // 当前写批次已经处理到最后一个合并的写批次，跳出循环
     if (ready == last_writer) break;
   }
 
   // Notify new head of write queue
+  // 通知新的写队列头部，唤醒等待的线程
   if (!writers_.empty()) {
     writers_.front()->cv.Signal();
   }
