@@ -48,7 +48,7 @@ struct DBImpl::Writer {
   WriteBatch* batch;
   bool sync;
   bool done;
-  port::CondVar cv;
+  port::CondVar cv; // 条件变量，用于等待当前写入操作完成
 };
 
 struct DBImpl::CompactionState {
@@ -1120,20 +1120,48 @@ int64_t DBImpl::TEST_MaxNextLevelOverlappingBytes() {
 Status DBImpl::Get(const ReadOptions& options, const Slice& key,
                    std::string* value) {
   Status s;
+  // db lock
   MutexLock l(&mutex_);
+
+  // 快照序列号，每次read仅仅读取小于等于该序列号的数据
   SequenceNumber snapshot;
   if (options.snapshot != nullptr) {
+    // 如果传入了快照，则使用快照的序列号
     snapshot =
         static_cast<const SnapshotImpl*>(options.snapshot)->sequence_number();
   } else {
+    // 否则使用最新的序列号
     snapshot = versions_->LastSequence();
   }
 
+  // 读取数据的优先级：memtable -> immutable memtable -> SSTables
   MemTable* mem = mem_;
+  // immutable memtable就是写到sst上限的memtable，正等待被压缩写入sst
   MemTable* imm = imm_;
+
+  // 这里的 version 是所有 sst 的元数据集合
+  // version的结构在此时产生快照（位于L0的sst在本次快照中永远位于L0）
+  // 就算后续有新的sst文件加入，当前的version也不会变化，而是产生新的version
+
+  // Compaction 前:  Version_1 (current)
+  //                 ├── L0: [sst_1, sst_2]
+  //                 └── L1: [sst_3]
+
+  //                       ↓ Compaction: sst_1 + sst_3 → sst_4
+
+  // Compaction 后:  Version_2 (current)  ← 新建的，成为 current
+  //                 ├── L0: [sst_2]
+  //                 └── L1: [sst_4]       ← 新文件
+
+  //                 Version_1             ← 仍然存在！只要有引用
+  //                 ├── L0: [sst_1, sst_2]
+  //                 └── L1: [sst_3]
+
   Version* current = versions_->current();
   mem->Ref();
   if (imm != nullptr) imm->Ref();
+
+  // 维护 version 的引用计数，防止被删除
   current->Ref();
 
   bool have_stat_update = false;
@@ -1144,17 +1172,23 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
     mutex_.Unlock();
     // First look in the memtable, then in the immutable memtable (if any).
     LookupKey lkey(key, snapshot);
+    // 先查询 memtable
     if (mem->Get(lkey, value, &s)) {
       // Done
-    } else if (imm != nullptr && imm->Get(lkey, value, &s)) {
+    }
+    // 再查询 immutable memtable
+    else if (imm != nullptr && imm->Get(lkey, value, &s)) {
       // Done
-    } else {
+    }
+    // 最后在version中查询 sstables
+    else {
       s = current->Get(options, lkey, value, &stats);
       have_stat_update = true;
     }
     mutex_.Lock();
   }
 
+  // have_stat_update 用于标记本次读取是否需要更新统计信息并可能触发 Compaction
   if (have_stat_update && current->UpdateStats(stats)) {
     MaybeScheduleCompaction();
   }
@@ -1208,21 +1242,39 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
   w.sync = options.sync;
   w.done = false;
 
+  // 获取锁
   MutexLock l(&mutex_);
+
+  // 将本次提交的数据加入等待队列
   writers_.push_back(&w);
+
+  // 如果当前写批次没有完成，或者当前写批次不是队列头，则等待
   while (!w.done && &w != writers_.front()) {
+
+    // Wait 会释放锁
     w.cv.Wait();
   }
+  // 如果当前写批次已经完成，直接返回状态（可能被其他线程完成）
   if (w.done) {
     return w.status;
   }
+
+  // 上述代码的作用的，在高并发写入的场景下，可以讲多个同时到达的写请求合并在一次IO操作中完成
+
+  // 高并发 + sync=true ： 极大提升（减少 fsync 次数）
+  // 高并发 + sync=false： 中等提升（合并 WAL 写入）
+  // 低并发             ： 无提升
 
   // May temporarily unlock and wait.
   Status status = MakeRoomForWrite(updates == nullptr);
   uint64_t last_sequence = versions_->LastSequence();
   Writer* last_writer = &w;
   if (status.ok() && updates != nullptr) {  // nullptr batch is for compactions
+
+    // 合并多个写请求到一个批次
+    // 注意此时持有锁，因此写批次从提交到合并的过程中，其他写请求会被阻塞
     WriteBatch* write_batch = BuildBatchGroup(&last_writer);
+
     WriteBatchInternal::SetSequence(write_batch, last_sequence + 1);
     last_sequence += WriteBatchInternal::Count(write_batch);
 
@@ -1231,7 +1283,9 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
     // and protects against concurrent loggers and concurrent writes
     // into mem_.
     {
-      mutex_.Unlock();
+      mutex_.Unlock(); // ← 释放锁，去做 I/O
+
+      // 写入 WAL 日志
       status = log_->AddRecord(WriteBatchInternal::Contents(write_batch));
       bool sync_error = false;
       if (status.ok() && options.sync) {
@@ -1241,8 +1295,11 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
         }
       }
       if (status.ok()) {
+        // 写入 MemTable
         status = WriteBatchInternal::InsertInto(write_batch, mem_);
       }
+
+      // 重新获取锁
       mutex_.Lock();
       if (sync_error) {
         // The state of the log file is indeterminate: the log record we
@@ -1262,8 +1319,9 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
     if (ready != &w) {
       ready->status = status;
       ready->done = true;
-      ready->cv.Signal();
+      ready->cv.Signal(); // 通知指定的写批次写入完成，唤醒等待的线程
     }
+    // 
     if (ready == last_writer) break;
   }
 

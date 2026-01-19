@@ -221,6 +221,9 @@ Status Table::InternalGet(const ReadOptions& options, const Slice& k, void* arg,
     Slice handle_value = iiter->value();
     FilterBlockReader* filter = rep_->filter;
     BlockHandle handle;
+
+    // Bloom Filter，如果key一定不存在则提前返回
+    // 避免大量使用不存在的Key时，频繁读取SSTable的Block带来的IO开销
     if (filter != nullptr && handle.DecodeFrom(&handle_value).ok() &&
         !filter->KeyMayMatch(handle.offset(), k)) {
       // Not found
