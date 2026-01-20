@@ -1362,6 +1362,16 @@ WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
   ++iter;  // Advance past "first"
   for (; iter != writers_.end(); ++iter) {
     Writer* w = *iter;
+    // 仅合并 sync 标记相同的写请求
+    // 根据 Leader 的 sync 标记，决定是否将后续的写请求合并进来
+
+    // Leader (first)	后续 Writer	能否合并    原因
+    // sync=true	    sync=true	✅	    都需要 fsync
+    // sync=true	    sync=false	✅	    一起 fsync 没问题（更安全）
+    // sync=false	    sync=true	❌	    不能把需要 sync 的放进不 sync 的批次
+    // sync=false	    sync=false	✅	    都不需要 fsync
+
+    // 判断是否要结束合并，如果不合并就仅写入第一个 Writer 的批次
     if (w->sync && !first->sync) {
       // Do not include a sync write into a batch handled by a non-sync write.
       break;
