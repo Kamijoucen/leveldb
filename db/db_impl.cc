@@ -403,6 +403,8 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
   // Open the log file
   std::string fname = LogFileName(dbname_, log_number);
   SequentialFile* file;
+
+  // 这里的file实际上是返回值，传入一个SequentialFile二级指针，函数内部会初始化
   Status status = env_->NewSequentialFile(fname, &file);
   if (!status.ok()) {
     MaybeIgnoreError(&status);
@@ -1266,6 +1268,9 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
   // 低并发             ： 无提升
 
   // May temporarily unlock and wait.
+
+  // 确保当前写入有足够的空间
+  // 如果空间不足会等待后台Compaction完成后再返回
   Status status = MakeRoomForWrite(updates == nullptr);
   uint64_t last_sequence = versions_->LastSequence();
 
@@ -1403,14 +1408,22 @@ WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
 Status DBImpl::MakeRoomForWrite(bool force) {
   mutex_.AssertHeld();
   assert(!writers_.empty());
+
+  // force：是否强制写入（跳过内存检查）
+  // allow_delay：是否允许延迟写入以等待后台 Compaction 完成
   bool allow_delay = !force;
   Status s;
   while (true) {
+
+    // 如果后台有错误，直接返回错误
     if (!bg_error_.ok()) {
       // Yield previous error
       s = bg_error_;
       break;
-    } else if (allow_delay && versions_->NumLevelFiles(0) >=
+    }
+
+    // 如果L0文件太多（>=8），则延迟写入，等待后台 Compaction 完成
+    else if (allow_delay && versions_->NumLevelFiles(0) >=
                                   config::kL0_SlowdownWritesTrigger) {
       // We are getting close to hitting a hard limit on the number of
       // L0 files.  Rather than delaying a single write by several
@@ -1419,36 +1432,60 @@ Status DBImpl::MakeRoomForWrite(bool force) {
       // this delay hands over some CPU to the compaction thread in
       // case it is sharing the same core as the writer.
       mutex_.Unlock();
+      // 等待 1ms
       env_->SleepForMicroseconds(1000);
+      // 只延迟一次，避免单个写入延迟过长
       allow_delay = false;  // Do not delay a single write more than once
       mutex_.Lock();
-    } else if (!force &&
+    }
+    // 如果有足够的内存空间，直接写入
+    // 检查方式是当前 mem 的内存使用量是否小于 write_buffer_size的配置
+    else if (!force &&
                (mem_->ApproximateMemoryUsage() <= options_.write_buffer_size)) {
       // There is room in current memtable
       break;
-    } else if (imm_ != nullptr) {
+    }
+    // 如果有 immutable memtable，说明当前 memtable 已满且正在后台压缩
+    // 等待后台压缩完成，通知background_work_finished_signal_唤醒写入线程
+    else if (imm_ != nullptr) {
       // We have filled up the current memtable, but the previous
       // one is still being compacted, so we wait.
       Log(options_.info_log, "Current memtable full; waiting...\n");
       background_work_finished_signal_.Wait();
-    } else if (versions_->NumLevelFiles(0) >= config::kL0_StopWritesTrigger) {
+    }
+    // 如果 L0 文件数已经达到上限（>=12），等待后台压缩完成
+    else if (versions_->NumLevelFiles(0) >= config::kL0_StopWritesTrigger) {
       // There are too many level-0 files.
       Log(options_.info_log, "Too many L0 files; waiting...\n");
       background_work_finished_signal_.Wait();
-    } else {
+    }
+    // 如果走到这里，说明当前 memtable 已满，且没有 immutable memtable，且 L0 文件数未达上限
+    // 那么就创建一个新的 memtable，并将当前 memtable 设为 immutable memtable，触发后台压缩
+    // 并切换到一个新的日志文件（WAL）
+    else {
       // Attempt to switch to a new memtable and trigger compaction of old
+
+      // 断言没有正在压缩的 immutable memtable
       assert(versions_->PrevLogNumber() == 0);
+
+      // 创建一个新的日志编号
       uint64_t new_log_number = versions_->NewFileNumber();
       WritableFile* lfile = nullptr;
+
+      // 创建一个顺序写日志文件
       s = env_->NewWritableFile(LogFileName(dbname_, new_log_number), &lfile);
+      // 如果失败
       if (!s.ok()) {
         // Avoid chewing through file number space in a tight loop.
+        // 回收日志编号并返回错误，避免日志因为失败导致编号浪费
         versions_->ReuseFileNumber(new_log_number);
         break;
       }
 
+      // 切换日志文件,释放旧的日志文件和日志写入器
       delete log_;
 
+      // 关闭旧的日志文件
       s = logfile_->Close();
       if (!s.ok()) {
         // We may have lost some data written to the previous log file.
@@ -1457,19 +1494,33 @@ Status DBImpl::MakeRoomForWrite(bool force) {
         //
         // We could perhaps attempt to save the memtable corresponding
         // to log file and suppress the error if that works, but that
-        // would add more complexity in a critical code path.
+        // would add more complexity in a critical code path.0
         RecordBackgroundError(s);
       }
       delete logfile_;
 
+      // 新的日志文件
       logfile_ = lfile;
+      // 新的日志文件编号
       logfile_number_ = new_log_number;
+      // 新的日志文件写入器
       log_ = new log::Writer(lfile);
+
+      // 将当前 memtable 设为 immutable memtable
       imm_ = mem_;
+
+      // has_imm 是一个原子bool。类似java中的volatile，但是c++的volatile不保证happens-before语义
+      // java的volatile更接近C++的 std::atomic<T> + memory_order_seq_cst
       has_imm_.store(true, std::memory_order_release);
+
+      // 创建一个新的 memtable
       mem_ = new MemTable(internal_comparator_);
       mem_->Ref();
+
+      // 本次已分配了新的 memtable, 肯定有写入空间，不需要强制压缩
       force = false;  // Do not force another compaction if have room
+
+      // 触发后台压缩 immutable memtable
       MaybeScheduleCompaction();
     }
   }
