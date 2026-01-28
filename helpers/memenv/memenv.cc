@@ -169,10 +169,12 @@ class SequentialFileImpl : public SequentialFile {
     if (pos_ > file_->Size()) {
       return Status::IOError("pos_ > file_->Size()");
     }
+    // file中剩余的可读数据
     const uint64_t available = file_->Size() - pos_;
     if (n > available) {
       n = available;
     }
+    // 更新当前位置
     pos_ += n;
     return Status::OK();
   }

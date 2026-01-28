@@ -31,18 +31,34 @@ Reader::Reader(SequentialFile* file, Reporter* reporter, bool checksum,
 Reader::~Reader() { delete[] backing_store_; }
 
 bool Reader::SkipToInitialBlock() {
+
+  // 计算初始偏移量所在 Block 的偏移位置
+  // 这里取模就是求余数，例如初始偏移量 1050，每个 Block 大小 100，取模后得到 50，
   const size_t offset_in_block = initial_offset_ % kBlockSize;
+
+  // 用初始化偏移量，减去所在 Block 内的偏移量，得到 Block 的起始位置
+  // 例如初始偏移量 1050，所在 Block 内偏移量 50，则 Block 起始位置为 1000
   uint64_t block_start_location = initial_offset_ - offset_in_block;
 
   // Don't search a block if we'd be in the trailer
+
+  // 这里判断，如果块内 offset 如果落在了块的最后 6 个字节（kBlockSize - 6），字节跳到下一个块的起始位置
+
+  // 为什么要这样？leveldb读取是是以 block为一个最小单位进行读取，
+  // 在不考虑这个限制时，block_start_location最理想位置其实是离offset_in_block最近的log的起始位置
+  // 由于offset_in_block之前的log因为跳过不能读取，只能读取offset_in_block之后的最近的log
+  // 而最后6个字节一定读不到一个完整的log，之前的log因为跳过不能读取，最近的一个有效log起始就是下一个block的起始log
+  // 因此 block_start_location 需要加上 kBlockSize
   if (offset_in_block > kBlockSize - 6) {
     block_start_location += kBlockSize;
   }
 
+  // end_of_buffer_offset_：buffer_末尾位置在文件中的偏移量（即已读取到的位置）
   end_of_buffer_offset_ = block_start_location;
 
   // Skip to start of first block that can contain the initial record
   if (block_start_location > 0) {
+    // 跳过到 block_start_location 位置
     Status skip_status = file_->Skip(block_start_location);
     if (!skip_status.ok()) {
       ReportDrop(block_start_location, skip_status);
@@ -54,7 +70,16 @@ bool Reader::SkipToInitialBlock() {
 }
 
 bool Reader::ReadRecord(Slice* record, std::string* scratch) {
+
+  // 如果已经读取的位置小于初始化要跳过的位置，则跳过到初始块
+  // last_record_offset_： 当前的读取进度
+  // initial_offset_： 构造函数中指定的初始偏移量
+  // 可能是日志中某些记录可能已经被写入 SSTable，不需要重新读取
+  // 或者者是从某个特定位置开始恢复数据 （展示没有理解到）
   if (last_record_offset_ < initial_offset_) {
+
+    // SkipToInitialBlock 跳转到 initial_offset_ 所在的块的起始位置
+    // 如果initial_offset_刚好在所对应块的后6个字节，则直接跳过到下一个块的起始位置
     if (!SkipToInitialBlock()) {
       return false;
     }
